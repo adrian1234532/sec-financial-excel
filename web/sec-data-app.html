@@ -1085,6 +1085,10 @@ function updatePageTitle() {
             align-self: start;
         }
 
+        .dcf-summary-top-grid {
+            min-width: 0;
+        }
+
         .dcf-workbench-projection {
             grid-area: projection;
             min-width: 0;
@@ -1144,6 +1148,17 @@ function updatePageTitle() {
         @media (max-width: 760px) {
             .dcf-workbench-sensitivity {
                 grid-template-columns: 1fr;
+            }
+
+            .dcf-summary-top-grid {
+                grid-template-columns: 1fr !important;
+            }
+
+            .dcf-summary-top-grid > div + div {
+                border-left: 0 !important;
+                border-top: 1px solid var(--term-border);
+                padding-left: 0 !important;
+                padding-top: 10px;
             }
 
             .dcf-review-body {
@@ -10625,6 +10640,228 @@ document.querySelectorAll('.frmImportMainBtn').forEach(btn => {
                 return Math.min(max, Math.max(min, value));
             }
 
+            function dcfPercentile(values, pct) {
+                const clean = (values || []).filter(v => Number.isFinite(v)).sort((a, b) => a - b);
+                if (!clean.length) return null;
+                if (clean.length === 1) return clean[0];
+                const p = dcfClamp(Number(pct) || 0, 0, 1);
+                const pos = (clean.length - 1) * p;
+                const lo = Math.floor(pos);
+                const hi = Math.ceil(pos);
+                if (lo === hi) return clean[lo];
+                const w = pos - lo;
+                return clean[lo] * (1 - w) + clean[hi] * w;
+            }
+
+            // Build a company-specific, robust FCF/EBITDA conversion history. The DCF uses
+            // unlevered FCF so the exit bridge is kept on the same enterprise-value basis.
+            // Quarterly companies are sampled at one-year intervals using rolling TTM values;
+            // annual-only companies use reported annual observations.
+            function dcfBuildEBITDAConversionProfile(co) {
+                const fcfRow = dcfFindExactRow(co,
+                    ['Metric: Unlevered Free Cash Flow', 'Unlevered Free Cash Flow'],
+                    ['5_KPI_Metrics']);
+                const ebitdaRow = dcfFindExactRow(co,
+                    ['EBITDA', 'Earnings Before Interest Taxes Depreciation and Amortization', 'Metric: EBITDA'],
+                    ['1_Income_Statement', '5_KPI_Metrics']);
+
+                if (!fcfRow || !ebitdaRow) {
+                    return {
+                        sampleCount: 0,
+                        confidence: 'fallback',
+                        historicalCenter: null,
+                        historicalMedian: null,
+                        recentMedian: null,
+                        q25: null,
+                        q75: null,
+                        dispersion: null,
+                        source: !fcfRow ? 'Unlevered FCF history unavailable' : 'EBITDA history unavailable',
+                        observations: []
+                    };
+                }
+
+                const fcfSeries = dcfBuildComparableSeries(fcfRow, co);
+                const ebitdaSeries = dcfBuildComparableSeries(ebitdaRow, co);
+                const step = companyIsAnnualOnly(co) ? 1 : 4;
+                const observations = [];
+
+                // Up to six annual/TTM points. Using one observation per year avoids heavily
+                // overlapping rolling-TTM windows from pretending to be independent evidence.
+                for (let year = 0; year < 6; year++) {
+                    const index = year * step;
+                    const fcf = dcfSeriesValueAtIndex(fcfSeries, index);
+                    const ebitda = dcfSeriesValueAtIndex(ebitdaSeries, index);
+                    if (!(fcf > 0) || !(ebitda > 0)) continue;
+                    const ratio = fcf / ebitda;
+                    // Very extreme ratios are usually one-off working-capital, capex, or data
+                    // artifacts. Keep a broad gate here; a company-relative robust filter follows.
+                    if (!Number.isFinite(ratio) || ratio < 0.03 || ratio > 1.50) continue;
+                    observations.push({
+                        index,
+                        period: co?.periods?.[index] || `P${index}`,
+                        fcf,
+                        ebitda,
+                        ratio
+                    });
+                }
+
+                if (!observations.length) {
+                    return {
+                        sampleCount: 0,
+                        confidence: 'fallback',
+                        historicalCenter: null,
+                        historicalMedian: null,
+                        recentMedian: null,
+                        q25: null,
+                        q75: null,
+                        dispersion: null,
+                        source: 'No valid positive FCF/EBITDA history',
+                        observations: []
+                    };
+                }
+
+                const rawRatios = observations.map(o => o.ratio);
+                const rawMedian = dcfMedian(rawRatios);
+                const absDevs = rawRatios.map(v => Math.abs(v - rawMedian));
+                const mad = dcfMedian(absDevs) || 0;
+                // MAD can be zero for stable series. Give the filter a modest company-relative
+                // floor so a tiny historical wiggle does not reject otherwise sensible points.
+                const robustHalfBand = Math.max(rawMedian * 0.15, mad * 3.5, 0.04);
+                let accepted = observations.filter(o => Math.abs(o.ratio - rawMedian) <= robustHalfBand);
+                if (accepted.length < Math.min(3, observations.length)) {
+                    accepted = observations
+                        .slice()
+                        .sort((a, b) => Math.abs(a.ratio - rawMedian) - Math.abs(b.ratio - rawMedian))
+                        .slice(0, Math.min(3, observations.length))
+                        .sort((a, b) => a.index - b.index);
+                }
+
+                const ratios = accepted.map(o => o.ratio);
+                const historicalMedian = dcfMedian(ratios);
+                const recentMedian = dcfMedian(accepted.slice(0, Math.min(3, accepted.length)).map(o => o.ratio));
+                // Favor the recent three-year operating regime without allowing one current
+                // period to dominate the normalized terminal conversion.
+                const historicalCenter = recentMedian !== null && historicalMedian !== null
+                    ? 0.60 * recentMedian + 0.40 * historicalMedian
+                    : (recentMedian ?? historicalMedian);
+                const q25 = dcfPercentile(ratios, 0.25);
+                const q75 = dcfPercentile(ratios, 0.75);
+                const dispersion = historicalMedian > 0 && q25 !== null && q75 !== null
+                    ? (q75 - q25) / historicalMedian
+                    : null;
+
+                let confidence = 'low';
+                if (accepted.length >= 5 && (dispersion === null || dispersion <= 0.30)) confidence = 'high';
+                else if (accepted.length >= 3 && (dispersion === null || dispersion <= 0.50)) confidence = 'medium';
+
+                return {
+                    sampleCount: accepted.length,
+                    confidence,
+                    historicalCenter,
+                    historicalMedian,
+                    recentMedian,
+                    q25,
+                    q75,
+                    dispersion,
+                    source: `${accepted.length} ${companyIsAnnualOnly(co) ? 'annual' : 'annual-spaced TTM'} observations · robust company history`,
+                    observations: accepted
+                };
+            }
+
+            // Resolve the terminal FCF/EBITDA conversion with neutral, company-relative guards.
+            // A lower conversion mechanically creates more EBITDA and a higher exit value; a
+            // higher conversion does the opposite. Blending current conversion with a robust
+            // historical center, then constraining the result to the company's interquartile
+            // history, avoids systematically bullish or bearish normalization.
+            function dcfResolveEBITDAConversion(state) {
+                const baseFCF = dcfToFinite(state?.baseFCF);
+                const baseEBITDA = dcfToFinite(state?.baseEBITDA);
+                const current = baseFCF > 0 && baseEBITDA > 0 ? baseFCF / baseEBITDA : null;
+                const profile = state?.ebitdaConversionProfile || {};
+                const historical = dcfToFinite(profile.historicalCenter);
+                const sampleCount = Number(profile.sampleCount) || 0;
+                const dispersion = dcfToFinite(profile.dispersion);
+
+                if (!(current > 0)) {
+                    return {
+                        current: null,
+                        target: null,
+                        historical,
+                        sampleCount,
+                        confidence: profile.confidence || 'fallback',
+                        historyWeight: 0,
+                        q25: dcfToFinite(profile.q25),
+                        q75: dcfToFinite(profile.q75),
+                        source: profile.source || 'Conversion unavailable'
+                    };
+                }
+
+                if (!(historical > 0) || sampleCount < 2) {
+                    return {
+                        current,
+                        target: dcfClamp(current, 0.08, 1.10),
+                        historical: null,
+                        sampleCount,
+                        confidence: 'fallback',
+                        historyWeight: 0,
+                        q25: null,
+                        q75: null,
+                        source: 'Current FCF / EBITDA held constant; insufficient comparable history'
+                    };
+                }
+
+                let historyWeight = profile.confidence === 'high' ? 0.70
+                    : profile.confidence === 'medium' ? 0.60 : 0.48;
+
+                // Volatile history deserves less weight. Conversely, a large current-period
+                // deviation from a reasonably supported history is more likely cyclical/noisy,
+                // so modestly lean back toward the historical operating regime.
+                if (dispersion !== null && dispersion > 0.45) historyWeight -= 0.10;
+                const divergence = Math.abs(current - historical) / historical;
+                if (sampleCount >= 3 && divergence > 0.35) historyWeight += 0.08;
+
+                // Respect deliberate analyst overrides of today's base values by giving the
+                // current conversion somewhat more influence, but never discarding history.
+                const touched = state?._touched || new Set();
+                if (touched.has('baseFCF') || touched.has('baseEBITDA')) historyWeight -= 0.12;
+                historyWeight = dcfClamp(historyWeight, 0.35, 0.78);
+
+                let target = current * (1 - historyWeight) + historical * historyWeight;
+                const q25 = dcfToFinite(profile.q25);
+                const q75 = dcfToFinite(profile.q75);
+                if (sampleCount >= 3 && q25 > 0 && q75 > 0) {
+                    // Symmetric interquartile guard: do not normalize below ~90% of the
+                    // historical 25th percentile (bullish) or above ~110% of the 75th
+                    // percentile (bearish) unless the company lacks sufficient history.
+                    const neutralLow = Math.max(0.08, q25 * 0.90);
+                    const neutralHigh = Math.min(1.10, q75 * 1.10);
+                    target = dcfClamp(target, neutralLow, neutralHigh);
+                }
+                target = dcfClamp(target, 0.08, 1.10);
+
+                return {
+                    current,
+                    target,
+                    historical,
+                    sampleCount,
+                    confidence: profile.confidence || 'low',
+                    historyWeight,
+                    q25,
+                    q75,
+                    dispersion,
+                    source: profile.source || 'Robust company history'
+                };
+            }
+
+            function dcfEBITDAConversionForYear(bridge, year) {
+                if (!(bridge?.current > 0) || !(bridge?.target > 0)) return null;
+                const t = dcfClamp((Number(year) || 0) / 10, 0, 1);
+                // Smoothstep gives a gradual operating normalization: no abrupt Year-1 jump,
+                // exactly half-way by Year 5, and full convergence in Year 10.
+                const smooth = t * t * (3 - 2 * t);
+                return bridge.current + (bridge.target - bridge.current) * smooth;
+            }
+
             // Convert a flow row into directly comparable annual or rolling-TTM observations.
             // Each observation retains its original column index so quarterly comparisons can
             // use exact four-quarter offsets without silently bridging missing periods.
@@ -10922,6 +11159,7 @@ document.querySelectorAll('.frmImportMainBtn').forEach(btn => {
                     }
                 }
                 if (!(baseEBITDA > 0)) warnings.push('A positive normalized EBITDA base is unavailable; exit-multiple valuation is disabled.');
+                const ebitdaConversionProfile = dcfBuildEBITDAConversionProfile(co);
 
                 const dilutedSharesRow = dcfFindExactRow(co,
                     ['Shares Outstanding Diluted', 'Diluted Shares Outstanding', 'Weighted Average Diluted Shares'],
@@ -11035,7 +11273,7 @@ document.querySelectorAll('.frmImportMainBtn').forEach(btn => {
 
                 return {
                     baseFCF, fcfSource, cashFlowBasis,
-                    baseEBITDA, ebitdaSource,
+                    baseEBITDA, ebitdaSource, ebitdaConversionProfile,
                     shares, sharesSource,
                     netDebt, netDebtSource,
                     totalDebt,
@@ -11116,6 +11354,7 @@ document.querySelectorAll('.frmImportMainBtn').forEach(btn => {
 
                 state.fcfSource = auto.fcfSource;
                 state.ebitdaSource = auto.ebitdaSource;
+                state.ebitdaConversionProfile = auto.ebitdaConversionProfile;
                 state.sharesSource = auto.sharesSource;
                 state.netDebtSource = auto.netDebtSource;
                 state.costOfDebtSource = auto.costOfDebtSource;
@@ -11194,6 +11433,7 @@ document.querySelectorAll('.frmImportMainBtn').forEach(btn => {
                     modelStatus: auto.methodProfile.eligible ? 'screen-grade' : 'not-decision-ready',
                     fcfSource: auto.fcfSource,
                     ebitdaSource: auto.ebitdaSource,
+                    ebitdaConversionProfile: auto.ebitdaConversionProfile,
                     sharesSource: auto.sharesSource,
                     netDebtSource: auto.netDebtSource,
                     costOfDebtSource: auto.costOfDebtSource,
@@ -11293,6 +11533,19 @@ document.querySelectorAll('.frmImportMainBtn').forEach(btn => {
                     add('error', 'terminal', 'EBITDA unavailable', 'Exit EV/EBITDA valuation requires positive normalized EBITDA.', ['baseEBITDA', 'exitMultiple']);
                 } else if (state.exitMultiple > multipleCeiling) {
                     add('check', 'terminal', 'High exit EV/EBITDA', `${state.exitMultiple.toFixed(1)}× exceeds the ${multipleCeiling.toFixed(1)}× review threshold for the inferred growth regime.`, ['exitMultiple']);
+                }
+
+                const conversionBridge = calc?.ebitdaBridge || dcfResolveEBITDAConversion(state);
+                if (state.exitMultiple > 0 && conversionBridge?.current > 0) {
+                    if (conversionBridge.confidence === 'fallback') {
+                        add('check', 'terminal', 'EBITDA conversion history limited', 'Exit EBITDA holds the current FCF/EBITDA conversion because comparable company history is insufficient.', ['baseFCF', 'baseEBITDA'], `current ${(conversionBridge.current * 100).toFixed(1)}%`);
+                    } else {
+                        const shift = (conversionBridge.target - conversionBridge.current) / conversionBridge.current;
+                        const severity = Math.abs(shift) > 0.30 ? 'check' : 'support';
+                        add(severity, 'terminal', 'EBITDA conversion normalization',
+                            `FCF/EBITDA conversion fades from ${(conversionBridge.current * 100).toFixed(1)}% to ${(conversionBridge.target * 100).toFixed(1)}% using ${conversionBridge.sampleCount} robust historical observations (${conversionBridge.confidence} confidence).`,
+                            ['baseFCF', 'baseEBITDA'], `${shift >= 0 ? '+' : ''}${(shift * 100).toFixed(1)}% conversion shift`);
+                    }
                 }
 
                 if (!growthEntered) {
@@ -11536,31 +11789,33 @@ document.querySelectorAll('.frmImportMainBtn').forEach(btn => {
                 const tgr = dcfToFinite(terminalGrowth) / 100;
                 const eMult = dcfToFinite(exitMultiple) || 0;
                 const roic = dcfToFinite(terminalROIC) / 100;
+                const ebitdaBridge = dcfResolveEBITDAConversion(state);
 
                 const projections = [];
                 if (state.methodEligible === false || !Number.isFinite(w) || w <= 0 || !Number.isFinite(baseFCF) || baseFCF <= 0) {
-                    for (let yr = 1; yr <= 10; yr++) projections.push({ yr, fcf: null, pv: null });
-                    return { ev: null, pvSum: null, pvTV: null, terminalValue: null, projections, terminalValueEEM: null, pvTVEEM: null, evEEM: null, hardFailure: state.methodEligible === false ? 'method-ineligible' : 'invalid-base' };
+                    for (let yr = 1; yr <= 10; yr++) projections.push({ yr, fcf: null, pv: null, ebitda: null, conversion: null });
+                    return { ev: null, pvSum: null, pvTV: null, terminalValue: null, projections, terminalValueEEM: null, pvTVEEM: null, evEEM: null, ebitdaBridge, year10Conversion: null, hardFailure: state.methodEligible === false ? 'method-ineligible' : 'invalid-base' };
                 }
 
                 let fcf = baseFCF;
-                let ebitda = Number.isFinite(baseEBITDA) && baseEBITDA > 0 ? baseEBITDA : null;
                 let pvSum = 0;
                 for (let yr = 1; yr <= 10; yr++) {
                     const g = yr <= 5 ? g1 : g2;
                     if (!Number.isFinite(g) || g <= -1) {
-                        projections.push({ yr, fcf: null, pv: null, ebitda: null });
+                        projections.push({ yr, fcf: null, pv: null, ebitda: null, conversion: null });
                         continue;
                     }
                     fcf = fcf * (1 + g);
-                    if (ebitda !== null) ebitda = ebitda * (1 + g);
+                    const conversion = dcfEBITDAConversionForYear(ebitdaBridge, yr);
+                    const ebitda = conversion !== null && conversion > 0 ? fcf / conversion : null;
                     const pv = fcf / Math.pow(1 + w, yr);
                     pvSum += pv;
-                    projections.push({ yr, fcf, pv, ebitda });
+                    projections.push({ yr, fcf, pv, ebitda, conversion });
                 }
 
                 const year10FCF = projections[9]?.fcf;
                 const year10EBITDA = projections[9]?.ebitda;
+                const year10Conversion = projections[9]?.conversion;
                 let terminalValue = null, pvTV = null, ev = null;
                 let terminalReinvestmentRate = null, terminalFCF = null;
                 if (Number.isFinite(year10FCF) && Number.isFinite(tgr) && w > tgr) {
@@ -11584,7 +11839,7 @@ document.querySelectorAll('.frmImportMainBtn').forEach(btn => {
                     evEEM = pvSum + pvTVEEM;
                 }
 
-                return { ev, pvSum, pvTV, terminalValue, projections, terminalValueEEM, pvTVEEM, evEEM, year10EBITDA, terminalFCF, terminalReinvestmentRate };
+                return { ev, pvSum, pvTV, terminalValue, projections, terminalValueEEM, pvTVEEM, evEEM, year10EBITDA, year10Conversion, ebitdaBridge, terminalFCF, terminalReinvestmentRate };
             }
 
             function dcfEquityValueFromEV(state, enterpriseValue) {
@@ -11686,6 +11941,17 @@ document.querySelectorAll('.frmImportMainBtn').forEach(btn => {
                 const calc = dcfCalcEV(base);
                 assert(calc.ev > 0 && calc.evEEM > 0, 'Both terminal methods should produce positive enterprise values.');
                 assert(Math.abs(calc.terminalValueEEM - calc.year10EBITDA * base.exitMultiple) < 0.01, 'Exit value must equal Year-10 EBITDA multiplied by EV/EBITDA.');
+                assert(calc.projections.every(p => p.ebitda === null || Math.abs(p.ebitda - p.fcf / p.conversion) < 0.01), 'Projected EBITDA must be derived from FCF divided by the explicit conversion path.');
+                const bridgeTestState = {
+                    ...base,
+                    ebitdaConversionProfile: {
+                        sampleCount: 5, confidence: 'high', historicalCenter: 0.60,
+                        q25: 0.55, q75: 0.66, dispersion: 0.18, source: 'self-test history'
+                    }
+                };
+                const bridgeTest = dcfCalcEV(bridgeTestState);
+                assert(bridgeTest.ebitdaBridge.target > bridgeTest.ebitdaBridge.current && bridgeTest.ebitdaBridge.target < 0.60, 'Conversion target must normalize between current conversion and robust history rather than jump to an extreme.');
+                assert(Math.abs(bridgeTest.year10Conversion - bridgeTest.ebitdaBridge.target) < 1e-9, 'Year-10 conversion must converge exactly to the normalized target.');
                 assert(dcfCalcPrice({ ...base, wacc: 9 }) > dcfCalcPrice(base), 'A lower WACC must increase value.');
                 assert(dcfCalcPrice({ ...base, stage1Growth: 7 }) > dcfCalcPrice(base), 'Higher Stage-1 growth must increase value.');
                 const debtFreePrice = dcfCalcPrice({ ...base, netDebt: 0 });
@@ -11711,7 +11977,7 @@ document.querySelectorAll('.frmImportMainBtn').forEach(btn => {
             function buildDCFColumnHTML(ci, co, color, state) {
                 state.terminalROIC = dcfComputeAutoTerminalROIC(state);
                 const calcResults = dcfCalcEV(state);
-                const { ev, pvSum, pvTV, terminalValue, projections, evEEM, pvTVEEM, terminalValueEEM, terminalReinvestmentRate, year10EBITDA } = calcResults;
+                const { ev, pvSum, pvTV, terminalValue, projections, evEEM, pvTVEEM, terminalValueEEM, terminalReinvestmentRate, year10EBITDA, year10Conversion, ebitdaBridge } = calcResults;
                 const equity = dcfEquityValueFromEV(state, ev);
                 const impliedPrice = (equity !== null && state.shares > 0) ? equity / state.shares : null;
                 const equityEEM = dcfEquityValueFromEV(state, evEEM);
@@ -11722,18 +11988,31 @@ document.querySelectorAll('.frmImportMainBtn').forEach(btn => {
                 const outMode = state.outputMode;
                 const baseVal = outMode === 'price' ? impliedPrice : ev;
                 const baseValEEM = outMode === 'price' ? impliedPriceEEM : evEEM;
+                const bridgeCurrent = ebitdaBridge?.current ?? null;
+                const bridgeHistorical = ebitdaBridge?.historical ?? null;
+                const bridgeTarget = ebitdaBridge?.target ?? null;
+                const bridgeYear10FCF = projections?.[9]?.fcf ?? null;
+                const bridgeConfidence = String(ebitdaBridge?.confidence || 'fallback').toUpperCase();
+                const bridgeSampleCount = Number(ebitdaBridge?.sampleCount) || 0;
+                const bridgeHistoryWeight = ebitdaBridge?.historyWeight ?? 0;
+                const bridgeShift = bridgeCurrent > 0 && bridgeTarget > 0 ? (bridgeTarget / bridgeCurrent - 1) : null;
+                const bridgeShiftColor = bridgeShift === null ? 'var(--term-text-dim)'
+                    : Math.abs(bridgeShift) < 0.08 ? 'var(--term-text-green)'
+                    : Math.abs(bridgeShift) < 0.25 ? 'var(--term-text-muted)' : 'var(--term-text-red)';
 
                 // Projection table (horizontal: years as columns)
                 let projHeaderCells = '';
                 let projFCFCells = '';
                 let projEBITDACells = '';
+                let projConversionCells = '';
                 let projPVCells = '';
-                projections.forEach(({ yr, fcf, pv, ebitda }) => {
+                projections.forEach(({ yr, fcf, pv, ebitda, conversion }) => {
                     const stage = yr <= 5 ? '1' : '2';
                     const bdr = yr === 5 ? 'border-right:2px solid var(--term-border);' : 'border-right:1px solid var(--term-bg-btn);';
                     projHeaderCells += '<th style="padding:5px 8px;text-align:right;color:var(--term-text-dim);font-weight:600;white-space:nowrap;' + bdr + '">Yr ' + yr + ' <span style="font-size:9px;color:var(--term-text-dimmer);font-weight:400;">[S' + stage + ']</span></th>';
                     projFCFCells += '<td style="padding:5px 8px;text-align:right;color:var(--term-text);font-variant-numeric:tabular-nums;' + bdr + '">' + dcfFmtRaw(fcf) + '</td>';
                     projEBITDACells += '<td style="padding:5px 8px;text-align:right;color:var(--term-text-dim);font-variant-numeric:tabular-nums;' + bdr + '">' + dcfFmtRaw(ebitda) + '</td>';
+                    projConversionCells += '<td style="padding:5px 8px;text-align:right;color:var(--term-text-dimmer);font-variant-numeric:tabular-nums;' + bdr + '">' + (conversion !== null && isFinite(conversion) ? (conversion * 100).toFixed(1) + '%' : '—') + '</td>';
                     projPVCells += '<td style="padding:5px 8px;text-align:right;color:var(--term-accent);font-variant-numeric:tabular-nums;' + bdr + '">' + dcfFmtRaw(pv) + '</td>';
                 });
 
@@ -11977,7 +12256,7 @@ document.querySelectorAll('.frmImportMainBtn').forEach(btn => {
 
                     <!-- 10-Year Projection Table (horizontal) -->
                     <div class="dcf-workbench-projection" style="border-bottom:1px solid var(--term-border);">
-                        <div style="padding:8px 14px 4px;font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--term-text-dimmer);">10-Year FCF Projection</div>
+                        <div style="padding:8px 14px 4px;font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--term-text-dimmer);">10-Year FCF / EBITDA Projection</div>
                         <div style="overflow-x:auto;">
                             <table style="width:100%;border-collapse:collapse;font-size:11px;">
                                 <thead>
@@ -12009,6 +12288,11 @@ document.querySelectorAll('.frmImportMainBtn').forEach(btn => {
                                         ${projEBITDACells}
                                         <td style="padding:5px 10px;text-align:right;color:var(--term-text-dim);font-variant-numeric:tabular-nums;">${dcfFmtRaw(year10EBITDA)}</td>
                                     </tr>
+                                    <tr style="border-bottom:1px solid var(--term-bg-btn);background:var(--term-bg-card);">
+                                        <td title="Projected unlevered FCF divided by projected EBITDA. This conversion fades automatically from the current company ratio toward a robust historical normalization target." style="padding:5px 10px;font-weight:600;color:var(--term-text-dimmer);white-space:nowrap;position:sticky;left:0;background:var(--term-bg-card);border-right:1px solid var(--term-border);">FCF / EBITDA</td>
+                                        ${projConversionCells}
+                                        <td style="padding:5px 10px;text-align:right;color:var(--term-text-dimmer);font-variant-numeric:tabular-nums;">${year10Conversion !== null && isFinite(year10Conversion) ? (year10Conversion * 100).toFixed(1) + '%' : '—'}</td>
+                                    </tr>
                                     <tr style="border-bottom:1px solid var(--term-bg-btn);background:var(--term-bg-sub);">
                                         <td style="padding:5px 10px;font-weight:600;color:var(--term-accent);white-space:nowrap;position:sticky;left:0;background:var(--term-bg-sub);border-right:1px solid var(--term-border);">PV of FCF</td>
                                         ${projPVCells}
@@ -12021,10 +12305,12 @@ document.querySelectorAll('.frmImportMainBtn').forEach(btn => {
 
                     <!-- Summary -->
                     <div class="dcf-workbench-summary" style="padding:10px 14px;border-bottom:1px solid var(--term-border);width:100%;">
-                        <div style="font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--term-text-dimmer);margin-bottom:8px;">Valuation Summary</div>
+                        <div class="dcf-summary-top-grid" style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;width:100%;margin-bottom:12px;">
+                            <div style="min-width:0;">
+                                <div style="font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--term-text-dimmer);border-bottom:1px solid var(--term-border);padding-bottom:4px;margin-bottom:4px;">Valuation Summary</div>
 
-                        <!-- Common Elements -->
-                        <div style="display:flex;flex-direction:column;gap:3px;font-size:11px;margin-bottom:12px;">
+                                <!-- Common Elements -->
+                                <div style="display:flex;flex-direction:column;gap:3px;font-size:11px;">
                             <div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--term-bg-btn);">
                                 <span style="color:var(--term-text-dim);">PV of FCFs (10yr)</span>
                                 <span style="color:var(--term-text);font-variant-numeric:tabular-nums;">${dcfFmtRaw(pvSum)}</span>
@@ -12069,6 +12355,55 @@ ${(() => {
                 </div>
             </div>`;
 })()}
+                                </div>
+                            </div>
+
+                            <!-- Exit EBITDA Bridge -->
+                            <div style="min-width:0;border-left:1px solid var(--term-border);padding-left:14px;">
+                                <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:9px;font-weight:700;text-transform:uppercase;color:var(--term-text-dimmer);border-bottom:1px solid var(--term-border);padding-bottom:4px;margin-bottom:4px;">
+                                    <span>Exit EBITDA Bridge</span>
+                                    <span title="Confidence reflects the number and stability of company-specific annual/TTM FCF-to-EBITDA observations." style="color:${bridgeConfidence === 'HIGH' ? 'var(--term-text-green)' : bridgeConfidence === 'MEDIUM' ? 'var(--term-accent)' : 'var(--term-text-muted)'};font-size:8px;">${bridgeConfidence}${bridgeSampleCount ? ` · ${bridgeSampleCount} OBS` : ''}</span>
+                                </div>
+                                <div style="display:flex;flex-direction:column;gap:3px;font-size:11px;">
+                                    <div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--term-bg-btn);">
+                                        <span style="color:var(--term-text-dim);">Base EBITDA</span>
+                                        <span style="color:var(--term-text);font-variant-numeric:tabular-nums;">${dcfFmtRaw(state.baseEBITDA)}</span>
+                                    </div>
+                                    <div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--term-bg-btn);">
+                                        <span style="color:var(--term-text-dim);">Base UFCF</span>
+                                        <span style="color:var(--term-text);font-variant-numeric:tabular-nums;">${dcfFmtRaw(state.baseFCF)}</span>
+                                    </div>
+                                    <div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--term-bg-btn);">
+                                        <span title="Current unlevered FCF divided by current EBITDA." style="color:var(--term-text-dim);">Current FCF / EBITDA</span>
+                                        <span style="color:var(--term-text);font-variant-numeric:tabular-nums;">${bridgeCurrent !== null && isFinite(bridgeCurrent) ? (bridgeCurrent * 100).toFixed(1) + '%' : '—'}</span>
+                                    </div>
+                                    <div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--term-bg-btn);">
+                                        <span title="Robust company-specific center: recent three-year median receives 60% weight and the broader robust median 40%, after outlier filtering." style="color:var(--term-text-dim);">Historical Normalized</span>
+                                        <span style="color:var(--term-text);font-variant-numeric:tabular-nums;">${bridgeHistorical !== null && isFinite(bridgeHistorical) ? (bridgeHistorical * 100).toFixed(1) + '%' : '—'}</span>
+                                    </div>
+                                    <div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--term-bg-btn);">
+                                        <span title="The terminal conversion is a neutral blend of current conversion and robust company history, constrained by the company's interquartile historical range." style="color:var(--term-text-dim);">Year-10 Conversion Target</span>
+                                        <span style="color:var(--term-accent);font-weight:700;font-variant-numeric:tabular-nums;">${bridgeTarget !== null && isFinite(bridgeTarget) ? (bridgeTarget * 100).toFixed(1) + '%' : '—'}</span>
+                                    </div>
+                                    <div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--term-bg-btn);">
+                                        <span style="color:var(--term-text-dim);">Normalization vs Current</span>
+                                        <span style="color:${bridgeShiftColor};font-weight:700;font-variant-numeric:tabular-nums;">${bridgeShift !== null && isFinite(bridgeShift) ? (bridgeShift >= 0 ? '+' : '') + (bridgeShift * 100).toFixed(1) + '%' : '—'}</span>
+                                    </div>
+                                    <div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--term-bg-btn);">
+                                        <span style="color:var(--term-text-dim);">Year-10 UFCF</span>
+                                        <span style="color:var(--term-text);font-variant-numeric:tabular-nums;">${dcfFmtRaw(bridgeYear10FCF)}</span>
+                                    </div>
+                                    <div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--term-border);font-weight:700;">
+                                        <span title="Year-10 UFCF divided by the normalized Year-10 FCF/EBITDA conversion target." style="color:var(--term-text);">Implied Year-10 EBITDA</span>
+                                        <span style="color:var(--term-accent);font-variant-numeric:tabular-nums;">${dcfFmtRaw(year10EBITDA)}</span>
+                                    </div>
+                                    <div style="margin-top:2px;padding:6px 8px;border:1px solid var(--term-border);background:var(--term-bg-sub);font-size:8.5px;line-height:1.35;color:var(--term-text-dimmer);">
+                                        ${bridgeSampleCount >= 2
+                                            ? `History weight ${(bridgeHistoryWeight * 100).toFixed(0)}% · smooth 10-year fade · IQR neutrality guard`
+                                            : 'Insufficient history · current conversion held constant'}
+                                    </div>
+                                </div>
+                            </div>
                         </div>
 
                         <!-- Split Elements: Perpetual vs Exit Multiple -->
