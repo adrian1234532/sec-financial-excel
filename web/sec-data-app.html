@@ -2,6 +2,108 @@
 <html lang="en">
 
 <head>
+
+<script id="local-proxy-fetch-shim">
+(() => {
+    if (window.__LOCAL_PROXY_FETCH_SHIM__) return;
+    window.__LOCAL_PROXY_FETCH_SHIM__ = true;
+
+    const nativeFetch = window.fetch.bind(window);
+    const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+
+    function decodeMaybe(value) {
+        if (!value) return value;
+        try { return decodeURIComponent(value); } catch (_) { return value; }
+    }
+
+    function unwrapLegacyProxy(u) {
+        const host = u.hostname.toLowerCase();
+
+        if (host === 'corsproxy.io') {
+            const raw = u.search.length > 1 ? u.search.slice(1) : '';
+            const target = decodeMaybe(raw);
+            if (/^https?:\/\//i.test(target)) return target;
+        }
+
+        if (host === 'api.codetabs.com') {
+            const target = u.searchParams.get('quest');
+            if (target && /^https?:\/\//i.test(target)) return target;
+        }
+
+        if (host === 'api.allorigins.win') {
+            const target = u.searchParams.get('url');
+            if (target && /^https?:\/\//i.test(target)) return target;
+        }
+
+        if (host === 'thingproxy.freeboard.io') {
+            const prefix = '/fetch/';
+            if (u.pathname.startsWith(prefix)) {
+                const target = decodeMaybe(u.pathname.slice(prefix.length) + u.search);
+                if (/^https?:\/\//i.test(target)) return target;
+            }
+        }
+
+        if (host === 'whateverorigin.com' || host === 'www.whateverorigin.com') {
+            const target = u.searchParams.get('url');
+            if (target && /^https?:\/\//i.test(target)) return target;
+        }
+
+        return u.href;
+    }
+
+    function shouldStayDirect(u) {
+        if (u.origin === window.location.origin) return true;
+        if (LOCAL_HOSTS.has(u.hostname)) return true; // local Qwen / llama.cpp / local services
+        return !/^https?:$/.test(u.protocol);
+    }
+
+    window.fetch = async function(input, init) {
+        const isReq = (typeof Request !== 'undefined' && input instanceof Request);
+        const raw = isReq ? input.url : String(input);
+        const u = new URL(raw, window.location.href);
+
+        if (shouldStayDirect(u)) {
+            return nativeFetch(input, init);
+        }
+
+        const target = unwrapLegacyProxy(u);
+        const proxyUrl = '/proxy?url=' + encodeURIComponent(target);
+
+        if (!isReq) {
+            return nativeFetch(proxyUrl, init);
+        }
+
+        const original = input.clone();
+        const method = (init && init.method) || original.method || 'GET';
+        const headers = new Headers(original.headers);
+
+        if (init && init.headers) {
+            new Headers(init.headers).forEach((v, k) => headers.set(k, v));
+        }
+
+        const opts = {
+            method,
+            headers,
+            credentials: 'same-origin',
+            redirect: 'follow',
+            signal: (init && init.signal) || original.signal
+        };
+
+        if (!/^(GET|HEAD)$/i.test(method)) {
+            if (init && Object.prototype.hasOwnProperty.call(init, 'body')) {
+                opts.body = init.body;
+            } else {
+                opts.body = await original.arrayBuffer();
+            }
+        }
+
+        return nativeFetch(proxyUrl, opts);
+    };
+
+    console.info('[Local Proxy] permanent fetch shim active');
+})();
+</script>
+
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Load CSV to Start</title>
