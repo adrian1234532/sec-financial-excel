@@ -6163,7 +6163,6 @@ CONCEPT_MAP = {
     'Cost of Revenue': {'tags': ['CostOfRevenue', 'CostOfGoodsAndServicesSold', 'CostOfGoodsAndServiceExcludingDepreciationDepletionAndAmortization', 'ProvisionForLoanAndLeaseLosses'], 'cat': '1_Income_Statement'},
     'Cost of Goods Sold': {'tags': ['CostOfGoodsSold', 'CostOfGoodsSoldRelatedParty'], 'cat': '1_Income_Statement'},
     'Cost of Services': {'tags': ['CostOfServices'], 'cat': '1_Income_Statement'},
-    'Cost of Revenue ex. DD&A': {'tags': ['CostOfRevenueExcludingDepreciationDepletionAndAmortization'], 'cat': '1_Income_Statement'},
     'Cost of Lease & Other Revenue': {'tags': ['OperatingLeasesCostOfLeaseRevenue'], 'cat': '1_Income_Statement'},
     'Gross Profit': {'tags': ['GrossProfit', 'RealEstateGrossProfit', 'GrossProfitRelatedParty'], 'cat': '1_Income_Statement'},
     'Premiums Earned': {'tags': ['PremiumsEarnedNet', 'LifeInsurancePremiums', 'HealthCarePremiumsNet', 'PremiumsAndOtherConsideration'], 'cat': '1_Income_Statement'},
@@ -29545,6 +29544,39 @@ def _null_segment_total_leaks(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# Constant-currency revenue is a measurement-basis reconciliation, not a
+# reportable segment/member.  Keep this detector deliberately exact: broad
+# tokens such as ``currency``, ``FX`` or ``adjusted`` are valid in unrelated
+# accounting and operating labels and would create a much larger regression
+# surface.  The optional segment-era suffix is presentation noise that can be
+# attached before late publication cleanup.
+_CONSTANT_CURRENCY_REVENUE_BASIS_RE = re.compile(
+    r'\bconstant(?:\s+|[-–—]+)currency\b', re.I)
+_SEGMENT_ERA_SUFFIX_RE = re.compile(
+    r'\s*\((?:pre|post)\s+change\)\s*$', re.I)
+
+
+def _strip_segment_era_suffix(label: str) -> str:
+    return _SEGMENT_ERA_SUFFIX_RE.sub('', str(label or '')).strip()
+
+
+def _is_constant_currency_revenue_member(member: str) -> bool:
+    text = _strip_segment_era_suffix(
+        re.sub(r'\s+', ' ', str(member or '')).strip())
+    return bool(text and _CONSTANT_CURRENCY_REVENUE_BASIS_RE.search(text))
+
+
+def _is_constant_currency_revenue_label(label: str) -> bool:
+    text = str(label or '').strip()
+    if ' - ' not in text:
+        return False
+    metric, member = text.split(' - ', 1)
+    return (
+        re.sub(r'\s+', ' ', metric).strip().casefold() == 'revenue'
+        and _is_constant_currency_revenue_member(member)
+    )
+
+
 def _move_noisy_business_segment_rows_to_disclosures(df: pd.DataFrame) -> pd.DataFrame:
     """Move obvious non-additive business-segment noise to disclosures.
 
@@ -29557,6 +29589,7 @@ def _move_noisy_business_segment_rows_to_disclosures(df: pd.DataFrame) -> pd.Dat
     if df is None or df.empty:
         return df
     noisy = []
+    constant_currency_rows = set()
     for idx in list(df.index):
         cat, lbl = idx
         if cat != '4a_Segments_Business':
@@ -29574,6 +29607,13 @@ def _move_noisy_business_segment_rows_to_disclosures(df: pd.DataFrame) -> pd.Dat
         # "acquired assets" are valid company operating measures here, not
         # dimensional accounting leaks to be reclassified as disclosures.
         if metric == 'operating measure':
+            continue
+        # A constant-currency revenue row is an FX-adjusted measurement-basis
+        # reconciliation.  It may coexist in the same HTML table as legitimate
+        # geographic revenue, but it is never itself a reportable segment.
+        if _is_constant_currency_revenue_label(text):
+            noisy.append(idx)
+            constant_currency_rows.add(idx)
             continue
         if metric == 'net income':
             noisy.append(idx)
@@ -29608,7 +29648,14 @@ def _move_noisy_business_segment_rows_to_disclosures(df: pd.DataFrame) -> pd.Dat
     df = df.copy()
     for idx in noisy:
         row = df.loc[idx].copy()
-        new_idx = ('6_Disclosures', f"Business Segment Disclosure - {idx[1]}")
+        if idx in constant_currency_rows:
+            # The era suffix was created only because this disclosure was
+            # temporarily treated as a segment.  Remove that artifact while
+            # preserving the filed measurement-basis wording and all values.
+            new_label = _strip_segment_era_suffix(idx[1])
+            new_idx = ('6_Disclosures', new_label)
+        else:
+            new_idx = ('6_Disclosures', f"Business Segment Disclosure - {idx[1]}")
         if new_idx in df.index:
             df.loc[new_idx, :] = df.loc[new_idx].combine_first(row).values
         else:
@@ -29630,6 +29677,8 @@ def _is_clean_top_level_segment_revenue_label(lbl: str) -> bool:
     member = _clean_segment_member_name(text)
     m = re.sub(r"\s+", " ", member.lower()).strip()
     if not m:
+        return False
+    if _is_constant_currency_revenue_member(member):
         return False
     if any(k in m for k in (
         'external customers', 'intersegment', 'elimination', 'product', 'service',
@@ -35396,10 +35445,17 @@ def _gb_reclassify_nonsemantic_segment_rows(df: pd.DataFrame) -> pd.DataFrame:
         if idx[0] != '4a_Segments_Business':
             continue
         _metric, member = _split_segment_display_label(idx[1])
+        is_constant_currency = _is_constant_currency_revenue_label(idx[1])
         if (_normalize_label_key(_metric) != 'revenue'
-                or not _gb_is_obvious_nonsegment_member(member)):
+                or not (is_constant_currency
+                        or _gb_is_obvious_nonsegment_member(member))):
             continue
-        target = ('6_Disclosures', f'Business Segment Disclosure - {idx[1]}')
+        target = (
+            '6_Disclosures',
+            (_strip_segment_era_suffix(idx[1])
+             if is_constant_currency
+             else f'Business Segment Disclosure - {idx[1]}')
+        )
         out = _gb_rename_or_merge_pivot_row(out, idx, target)
         moved.append(idx[1])
     if moved:
@@ -38731,6 +38787,8 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
     def _is_noise_segment_member(member):
         m = re.sub(r"\s+", " ", str(member or '').lower()).strip()
         if not m:
+            return True
+        if _is_constant_currency_revenue_member(member):
             return True
         # Non-additive disclosures or noisy one-off rows.
         if any(k in m for k in (
