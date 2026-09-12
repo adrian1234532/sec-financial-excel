@@ -6163,6 +6163,7 @@ CONCEPT_MAP = {
     'Cost of Revenue': {'tags': ['CostOfRevenue', 'CostOfGoodsAndServicesSold', 'CostOfGoodsAndServiceExcludingDepreciationDepletionAndAmortization', 'ProvisionForLoanAndLeaseLosses'], 'cat': '1_Income_Statement'},
     'Cost of Goods Sold': {'tags': ['CostOfGoodsSold', 'CostOfGoodsSoldRelatedParty'], 'cat': '1_Income_Statement'},
     'Cost of Services': {'tags': ['CostOfServices'], 'cat': '1_Income_Statement'},
+    'Cost of Revenue ex. DD&A': {'tags': ['CostOfRevenueExcludingDepreciationDepletionAndAmortization'], 'cat': '1_Income_Statement'},
     'Cost of Lease & Other Revenue': {'tags': ['OperatingLeasesCostOfLeaseRevenue'], 'cat': '1_Income_Statement'},
     'Gross Profit': {'tags': ['GrossProfit', 'RealEstateGrossProfit', 'GrossProfitRelatedParty'], 'cat': '1_Income_Statement'},
     'Premiums Earned': {'tags': ['PremiumsEarnedNet', 'LifeInsurancePremiums', 'HealthCarePremiumsNet', 'PremiumsAndOtherConsideration'], 'cat': '1_Income_Statement'},
