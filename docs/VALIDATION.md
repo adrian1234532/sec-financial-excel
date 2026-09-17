@@ -23,6 +23,6 @@ To run the local checks:
 
 ```bash
 python -m pytest -q -p no:cacheprovider
-ruff check pipeline_audit.py excel_lineage.py sec_data_cli.py tests tools
+ruff check pipeline_audit.py excel_lineage.py sec_data_cli.py review_luna tests tools
 mypy --ignore-missing-imports pipeline_audit.py excel_lineage.py sec_data_cli.py
 ```

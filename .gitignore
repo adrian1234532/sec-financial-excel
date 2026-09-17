@@ -2,7 +2,9 @@
 .venv/
 output/
 outputs/
-review_luna/
+review_luna/*
+!review_luna/__init__.py
+!review_luna/run_review.py
 .tmp/
 __pycache__/
 *.py[cod]
