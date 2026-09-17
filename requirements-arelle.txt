@@ -1,0 +1,2 @@
+-r requirements.txt
+arelle-release==2.44.7

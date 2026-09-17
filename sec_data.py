@@ -4,7 +4,6 @@ import httpx
 import pandas as pd
 import numpy as np
 import re
-import argparse
 import warnings
 import atexit
 import copy
@@ -18,6 +17,7 @@ import math
 import shutil
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from datetime import date, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps, lru_cache
 from io import StringIO, BytesIO
@@ -4443,7 +4443,10 @@ def _initialize_sec_identity():
     if _SEC_IDENTITY_INITIALIZED:
         return
 
-    env_identity = os.environ.get("SEC_IDENTITY", "").strip()
+    env_identity = (
+        os.environ.get("SEC_IDENTITY", "").strip()
+        or os.environ.get("SEC_USER_AGENT", "").strip()
+    )
     if env_identity:
         # Keep compatibility with edgartools' accepted free-form identity
         # string for CI, containers, and other non-interactive environments.
@@ -6300,7 +6303,7 @@ CONCEPT_MAP = {
     'Amortization of Intangibles (CF)': {'tags': ['AmortizationOfIntangibleAssets', 'AmortizationAndImpairmentOfIntangibleAssets'], 'cat': '3_Cash_Flow'},
     'Stock-Based Compensation': {'tags': ['ShareBasedCompensation', 'AllocatedShareBasedCompensationExpense', 'ShareBasedCompensationExpense', 'NoncashOrPartNoncashExpenseShareBasedCompensation'], 'cat': '3_Cash_Flow'},
     'Deferred Income Taxes': {'tags': ['DeferredIncomeTaxExpenseBenefit', 'DeferredIncomeTaxesAndTaxCredits', 'DeferredIncomeTaxAssetsNet'], 'cat': '3_Cash_Flow'},
-    'Gain/Loss on Investments (CF)': {'tags': ['GainLossOnInvestments', 'GainLossOnSaleOfInvestments', 'UnrealizedGainLossOnInvestments', 'EquitySecuritiesFvNiGainLoss', 'DebtSecuritiesGainLoss', 'RealizedInvestmentGainsLosses', 'MarketableSecuritiesUnrealizedGainLoss', 'DebtAndEquitySecuritiesUnrealizedGainLoss', 'UnrealizedGainLossOnMarketableAndNonmarketableEquityInvestments', 'GainLossOnSaleOfDerivatives', 'EquitySecuritiesFvNiUnrealizedGainLoss'], 'cat': '3_Cash_Flow'},
+    'Gain/Loss on Investments (CF)': {'tags': ['DebtAndEquitySecuritiesGainLoss', 'GainLossOnInvestments', 'GainLossOnSaleOfInvestments', 'UnrealizedGainLossOnInvestments', 'EquitySecuritiesFvNiGainLoss', 'DebtSecuritiesGainLoss', 'RealizedInvestmentGainsLosses', 'MarketableSecuritiesUnrealizedGainLoss', 'DebtAndEquitySecuritiesUnrealizedGainLoss', 'UnrealizedGainLossOnMarketableAndNonmarketableEquityInvestments', 'GainLossOnSaleOfDerivatives', 'EquitySecuritiesFvNiUnrealizedGainLoss'], 'cat': '3_Cash_Flow'},
     'Other Non-Cash Items': {'tags': ['OtherNoncashIncomeExpense', 'OtherNoncashIncome'], 'cat': '3_Cash_Flow'},
     'Change in AR': {'tags': ['IncreaseDecreaseInAccountsReceivable', 'IncreaseDecreaseInAccountsAndOtherReceivables', 'IncreaseDecreaseInAccountsReceivableAndOtherOperatingAssets', 'IncreaseDecreaseInReceivables'], 'cat': '3_Cash_Flow'},
     'Change in Inventory': {'tags': ['IncreaseDecreaseInInventories', 'IncreaseDecreaseInInventoriesAndOtherOperatingAssets'], 'cat': '3_Cash_Flow'},
@@ -10244,6 +10247,9 @@ _GB_ROLE_SEGMENT_ASSETS = 'segment_assets'
 _GB_ROLE_GEOGRAPHIC_REVENUE = 'geographic_revenue'
 _GB_ROLE_GEOGRAPHIC_ASSETS = 'geographic_assets'
 _GB_ROLE_COST_OF_REVENUE = 'cost_of_revenue_breakdown'
+_GB_ROLE_RESEARCH_DEVELOPMENT_EXPENSE = (
+    'research_and_development_expense_breakdown'
+)
 _GB_ROLE_SIGNIFICANT_SEGMENT_EXPENSE = 'significant_segment_expenses'
 _GB_ROLE_COMPANY_DEFINED_SEGMENT_MEASURE = 'company_defined_segment_measure'
 _GB_ROLE_CONSOLIDATED_RECONCILIATION = 'consolidated_reconciliation'
@@ -10262,6 +10268,8 @@ _GB_ASSET_ROLE_RE = re.compile(
 _GB_COST_REVENUE_ROLE_RE = re.compile(
     r'\b(?:costs?\s+of\s+revenues?|traffic\s+acquisition\s+costs?|tac|'
     r'other\s+costs?\s+of\s+revenues?)\b', re.I)
+_GB_RESEARCH_DEVELOPMENT_EXPENSE_ROLE_RE = re.compile(
+    r'\b(?:research\s+and\s+development|r\s*&\s*d)\s+expenses?\b', re.I)
 _GB_SEGMENT_EXPENSE_ROLE_RE = re.compile(
     r'\b(?:significant\s+(?:segment\s+)?expenses?|expenses?\s+attributable\s+to'
     r'\s+(?:the\s+)?(?:reportable\s+)?segments?|other\s+segment\s+items?|'
@@ -10735,6 +10743,18 @@ def _gb_classify_business_table_role(table: pd.DataFrame,
         return (_GB_ROLE_REPORTABLE_SEGMENT_PNL, None, 0.99,
                 'reportable_segment_pnl')
 
+    # A component table headed "Research and development expense" is an
+    # expense breakdown even when nearby narrative still contains a Revenue
+    # heading.  Row labels such as Clinical, Discovery, and Platform are not
+    # reportable-segment revenue without independent revenue evidence.
+    if _GB_RESEARCH_DEVELOPMENT_EXPENSE_ROLE_RE.search(local_corpus):
+        return (
+            _GB_ROLE_RESEARCH_DEVELOPMENT_EXPENSE,
+            'Research & Development Expense',
+            0.995,
+            'research_and_development_expense_breakdown',
+        )
+
     # Explicit row-section evidence outranks a table-level asset/depreciation
     # mention.  Modern single-segment disclosures often place significant
     # segment expenses, depreciation and total segment assets in one table.
@@ -10870,6 +10890,11 @@ def _gb_route_for_table_role(role: str):
     if role == _GB_ROLE_GEOGRAPHIC_ASSETS:
         # Preserve the disclosed fact without pretending it is geographic
         # revenue or a reportable business segment.
+        return '6_Disclosures'
+    if role == _GB_ROLE_RESEARCH_DEVELOPMENT_EXPENSE:
+        # Preserve the accurately classified disclosure in the audit backend.
+        # A company/industry mapping may later promote selected rows to the
+        # research-facing KPI sheet.
         return '6_Disclosures'
     return '4a_Segments_Business'
 
@@ -11815,6 +11840,12 @@ def _gb_row_label(value) -> str:
 
 def _gb_section_from_header(label: str):
     normalized = str(label or '').lower().rstrip(':').strip()
+    if normalized in {
+            'research and development expense',
+            'research and development expenses',
+            'r&d expense',
+            'r&d expenses'}:
+        return True, 'Research & Development Expense'
     if (_GB_CONSOLIDATED_HEADER_RE.match(normalized)
             or _GB_SECTION_TERMINATOR_RE.match(normalized)):
         return False, None
@@ -13076,6 +13107,7 @@ def _extract_generic_business_breakdown_from_table(
         _GB_ROLE_GEOGRAPHIC_ASSETS,
         _GB_ROLE_GEOGRAPHIC_REVENUE,
         _GB_ROLE_COST_OF_REVENUE,
+        _GB_ROLE_RESEARCH_DEVELOPMENT_EXPENSE,
         _GB_ROLE_SIGNIFICANT_SEGMENT_EXPENSE,
         _GB_ROLE_COMPANY_DEFINED_SEGMENT_MEASURE,
         _GB_ROLE_OPERATING_METRIC,
@@ -18529,6 +18561,13 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
         else:
             _fact.setdefault('StartEstimated', False)
 
+    # Use the original income-table occurrence to distinguish the total from
+    # supplemental revenue concepts (for example revenue excluding hedging).
+    from pipeline_audit import attach_income_face_evidence
+    try:
+        extracted = attach_income_face_evidence(extracted, fetch_html(filing))
+    except (ValueError, TypeError) as exc:
+        print(f"  Warning: income face provenance unavailable: {exc}")
     return extracted, period_end_date
 
 def _recover_annual_cashflow_from_html(extracted, filing, ye_month):
@@ -24829,11 +24868,16 @@ def _gb_prove_dissimilar_revenue_member_handoff(
 
 def build_pivoted_data(all_facts, ticker, ye_month, company_name=None, is_financial=False, is_insurance=False, is_oil_gas=False, is_reit=False):
     with _ProfileTimer("build_pivoted_data_total"):
-        return _build_pivoted_data_impl(
+        from pipeline_audit import enrich_output_audit, retain_derivation_inputs, require_complete_output_evidence
+        result = _build_pivoted_data_impl(
             all_facts, ticker, ye_month, company_name=company_name,
             is_financial=is_financial, is_insurance=is_insurance,
             is_oil_gas=is_oil_gas, is_reit=is_reit,
         )
+        result = retain_derivation_inputs(result, all_facts)
+        enrich_output_audit(result, GLOBAL_CALC_PARENT,
+            _CF_OPERATING_PARENTS | _CF_INVESTING_PARENTS | _CF_FINANCING_PARENTS)
+        return require_complete_output_evidence(result)
 
 
 
@@ -25274,6 +25318,8 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     df = _gb_quarantine_conflicting_semantic_duplicates(df)
     df = _gb_prefer_instant_segment_asset_candidates(df)
     df = _gb_prefer_complete_instant_asset_table_candidates(df)
+    from pipeline_audit import prefer_cashflow_face_candidates
+    df = prefer_cashflow_face_candidates(df, _FACE_PRESENTED)
 
     # Retain direct discrete-Q4 candidates after every label/semantic
     # reconciliation pass but before latest-filed dedup.  This narrow ledger is
@@ -25464,13 +25510,22 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                 if other_da is not None:
                     selected_components.append(other_da)
 
-                if selected_components:
+                # A single component (for example intangible amortization) is
+                # not a D&A total.  Keep a reported depreciation total, or a
+                # combination that spans at least two independent families.
+                if dep_total is not None:
+                    # A cash-flow face line tagged simply ``Depreciation`` is
+                    # already the reported statement amount.  Do not add an
+                    # income-statement intangible-amortization disclosure to it.
+                    new_da_rows.append(
+                        dep_total.drop(labels=['_NumericValue'], errors='ignore'))
+                elif len(selected_components) >= 2:
                     best_row = selected_components[0].copy()
                     best_row['Value'] = sum(float(r['_NumericValue']) for r in selected_components)
                     best_row['TagRank'] = 0
                     best_row['Concept'] = 'DerivedDepreciationAndAmortizationComponents'
                     new_da_rows.append(best_row.drop(labels=['_NumericValue'], errors='ignore'))
-                else:
+                elif not selected_components:
                     # Preserve an unusual mapped D&A concept rather than losing
                     # data merely because its taxonomy name is not yet classified.
                     new_da_rows.append(f_group.sort_values(['_Filed_dt', 'TagRank'], ascending=[False, True]).iloc[0])
@@ -28718,7 +28773,8 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     final_pivot = _apply_industry_kpis(final_pivot, is_financial=is_financial, is_insurance=is_insurance)
     final_pivot = _recompute_cf_residuals(final_pivot)
     final_pivot = _move_noisy_business_segment_rows_to_disclosures(final_pivot)
-    final_pivot = _validate_and_repair_segment_data(final_pivot)
+    final_pivot = _validate_and_repair_segment_data(final_pivot, fact_audit)
+    fact_audit = final_pivot.attrs.get('fact_audit', fact_audit)
     final_pivot = _null_segment_total_leaks(final_pivot)
     final_pivot = _merge_prefix_continuation_members(final_pivot)
     final_pivot = _gb_consolidate_pivot_segment_duplicates(final_pivot)
@@ -36551,8 +36607,110 @@ def _repair_balance_sheet_identity(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _validate_and_repair_segment_data(df: pd.DataFrame) -> pd.DataFrame:
+def _validate_and_repair_segment_data(
+        df: pd.DataFrame, fact_audit: pd.DataFrame | None = None) -> pd.DataFrame:
     df = df.copy()
+    audit = fact_audit.copy() if isinstance(fact_audit, pd.DataFrame) else pd.DataFrame()
+
+    def _selected_audit_row(category, label, period, value):
+        if audit.empty:
+            return None
+        candidates = audit[
+            audit.Category.eq(category)
+            & audit.Label.eq(label)
+            & audit.Period.eq(period)
+        ].copy()
+        if candidates.empty:
+            return None
+        numbers = pd.to_numeric(candidates.Value, errors='coerce')
+        candidates = candidates[np.isclose(numbers, float(value), rtol=1e-12, atol=1e-6)]
+        if candidates.empty:
+            return None
+        candidates['_proof'] = (
+            candidates.get('SourceCellIdentity', pd.Series('', index=candidates.index))
+            .fillna('').astype(str).str.startswith('/').astype(int)
+            + candidates.get('SourceTableEvidence', pd.Series('', index=candidates.index))
+            .fillna('').astype(str).str.len().gt(2).astype(int)
+        )
+        return candidates.sort_values('_proof', ascending=False).index[0]
+
+    def _record_cumulative_subtraction(category, label, output_period,
+                                       cumulative_value, baseline_period,
+                                       baseline_value, output_value):
+        """Replace a heuristic display mutation with an auditable derivation."""
+        nonlocal audit
+        cumulative_index = _selected_audit_row(
+            category, label, output_period, cumulative_value)
+        baseline_index = _selected_audit_row(
+            category, label, baseline_period, baseline_value)
+        if cumulative_index is None or baseline_index is None:
+            return False
+        cumulative = audit.loc[cumulative_index].to_dict()
+        baseline = audit.loc[baseline_index].to_dict()
+        compatible = all(
+            str(cumulative.get(field, '')) == str(baseline.get(field, ''))
+            for field in ('Concept', 'SourceExactUnitKind',
+                          'SourceDimensionAxes', 'SourceDimensionMembers')
+        )
+        if not compatible:
+            return False
+        try:
+            cumulative_start = date.fromisoformat(str(cumulative.get('Start')))
+            baseline_start = date.fromisoformat(str(baseline.get('Start')))
+            baseline_end = date.fromisoformat(str(baseline.get('End')))
+            cumulative_end = date.fromisoformat(str(cumulative.get('End')))
+            # Magnitude is only an anomaly signal.  A subtraction is valid
+            # only when the first fact is a true cumulative interval and the
+            # baseline is its leading sub-interval.
+            if cumulative_start != baseline_start or baseline_end >= cumulative_end:
+                return False
+            start = (baseline_end + timedelta(days=1)).isoformat()
+            end = cumulative_end.isoformat()
+        except ValueError:
+            return False
+        if start > end:
+            return False
+
+        def operand(source, coefficient):
+            return {
+                field: source.get(field) for field in (
+                    'Value', 'Accession', 'Concept', 'SourceConceptQName',
+                    'Start', 'End', 'Label', 'SourceReportedValue',
+                    'SourceRawValue', 'SourceCellIdentity',
+                    'SourceTableEvidence', 'SourceEvidenceAxes',
+                    'SourceEvidenceMembers', 'SourceDimensionAxes',
+                    'SourceDimensionMembers')
+            } | {
+                'Coefficient': str(coefficient),
+                'Unit': source.get('SourceExactUnitKind') or 'USD',
+            }
+
+        inputs = [operand(cumulative, 1), operand(baseline, -1)]
+        audit.at[cumulative_index, 'Value'] = output_value
+        audit.at[cumulative_index, 'Start'] = start
+        audit.at[cumulative_index, 'End'] = end
+        audit.at[cumulative_index, 'SourceKind'] = 'derived'
+        audit.at[cumulative_index, 'SourceReportedValue'] = np.nan
+        audit.at[cumulative_index, 'SourceRawValue'] = np.nan
+        audit.at[cumulative_index, 'SourceCellIdentity'] = np.nan
+        audit.at[cumulative_index, 'SourceDerivation'] = 'cumulative_minus_reported_baseline'
+        audit.at[cumulative_index, 'SourceDerivationFormula'] = (
+            f"{cumulative_value} - {baseline_value} = {output_value}")
+        audit.at[cumulative_index, 'SourceInputFacts'] = json.dumps(
+            inputs, ensure_ascii=False, default=str)
+        audit.at[cumulative_index, 'SourceInputAccessions'] = ';'.join(
+            str(item.get('Accession')) for item in (cumulative, baseline)
+            if item.get('Accession'))
+        audit.at[cumulative_index, 'SourceAdmissionRule'] = (
+            'retained_cumulative_minus_reported_baseline')
+        audit.at[cumulative_index, 'SourceEvidenceStatus'] = 'PASS'
+        confidence_values = pd.to_numeric(pd.Series([
+            cumulative.get('SourceClassificationConfidence'),
+            baseline.get('SourceClassificationConfidence'),
+        ]), errors='coerce').dropna()
+        audit.at[cumulative_index, 'SourceClassificationConfidence'] = (
+            float(confidence_values.min()) if not confidence_values.empty else 0.95)
+        return True
     SEG_CATS_LOCAL = {'4a_Segments_Business', '4b_Segments_Geographic_Regions', '4c_Segments_Geographic_Countries', '4d_Segments_Cross_Tabulated'}
     seg_rev_labels = [
         (cat, lbl)
@@ -36629,6 +36787,10 @@ def _validate_and_repair_segment_data(df: pd.DataFrame) -> pd.DataFrame:
                     discrete_q2 = v2 - v1
                     s2_discrete = _share(discrete_q2, q2c)
                     if discrete_q2 > 0 and s2_discrete is not None and abs(s2_discrete - s1) < s1 * 0.6 + 0.08:
+                        if not _record_cumulative_subtraction(
+                                seg_idx[0], seg_idx[1], q2c, v2,
+                                q1c, v1, discrete_q2):
+                            continue
                         df.at[seg_idx, q2c] = discrete_q2
                         print(f"  [Segment Q2 Fix] YTD6 contamination corrected: {seg_idx[1]} {fy}-Q2: {v2:,.0f} -> {discrete_q2:,.0f}")
                         
@@ -36688,6 +36850,7 @@ def _validate_and_repair_segment_data(df: pd.DataFrame) -> pd.DataFrame:
                     lbl = seg_idx[1]
                     print(f"  [Segment Q4 Fix] Implausible negative revenue nulled: {lbl} {fy}-Q4 = {v4:,.0f}")
 
+    df.attrs['fact_audit'] = audit
     return df
 
 
@@ -36950,13 +37113,17 @@ def _audit_segment_footing(df, ticker, ye_month):
             if abs(float(_total) - _sum) / abs(float(_total)) <= 0.05:
                 cross_category_verified.add(_column)
     
+    geography = {'4b_Segments_Geographic_Regions', '4c_Segments_Geographic_Countries'}
     for cat in seg_cats:
+        if cat == '4c_Segments_Geographic_Countries':
+            continue
+        basis_categories = geography if cat in geography else {cat}
         # Require exactly 1 ' - ' for 4a/4b/4c to prevent matching cross-tabulated sub-breakdowns that don't directly foot
         # For 4d, we allow 2 ' - 's.
         if cat == '4d_Segments_Cross_Tabulated':
             seg_labels = [(c, lbl) for (c, lbl) in df.index if c == cat and lbl.startswith('Revenue - ') and lbl.count(' - ') >= 1]
         else:
-            seg_labels = [(c, lbl) for (c, lbl) in df.index if c == cat and lbl.startswith('Revenue - ') and lbl.count(' - ') == 1]
+            seg_labels = [(c, lbl) for (c, lbl) in df.index if c in basis_categories and lbl.startswith('Revenue - ') and lbl.count(' - ') == 1]
 
         if not seg_labels:
             continue
@@ -38002,78 +38169,12 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
         add_val('5_KPI_Metrics', 'Metric: Unlevered Free Cash Flow', ufcf_series[ufcf_series.notna()])
 
     # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-    # SHARES OUTSTANDING & EPS -- Thorough Derivation
-    # Step 1: Derive missing shares from NI / EPS (with backfill)
-    # Step 2: Derive missing EPS   from NI / shares
+    # SHARES OUTSTANDING & EPS -- Reported values only
     # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
-    # -- Basic Shares -------------------------------------------------
-    eps_b_orig = get_num('EPS Basic').replace(0, np.nan)
-    shares_b   = get_row('Shares Outstanding Basic')
-    shares_b_n = pd.to_numeric(shares_b, errors='coerce').replace(0, np.nan)
+    # EPS and weighted-average shares are reported-only. Do not backfill
+    # shares across periods or infer missing EPS from those assumed weights.
 
-    # -- EPS numerator calibration --------------------------------------
-    # For umbrella structures (e.g. IBKR, where the public company owns a
-    # minority of the group), the consolidated 'Net Income' row includes
-    # earnings attributable to noncontrolling interests, so NI / shares
-    # massively overstates derived EPS.  Calibrate against quarters where
-    # BOTH a filed EPS and a filed share count exist: whichever numerator
-    # (consolidated vs ex-NCI) reproduces the filed EPS wins.
-    ni_for_eps = ni_n
-    _nci_kpi = get_num('Net Income to Noncontrolling Interest').fillna(0)
-    if (_nci_kpi != 0).any():
-        _ni_ex_nci = ni_n - _nci_kpi
-        _calib = eps_b_orig.notna() & shares_b_n.notna() & ni_n.notna()
-        # Calibrate on the 12 most recent qualifying quarters: old eras mix
-        # stale share counts / pre-split figures and dilute the signal.
-        _cq = sorted([str(c) for c in _calib.index[_calib]], reverse=True)[:12]
-        _calib = _calib & _calib.index.isin(_cq)
-        if _calib.any():
-            _implied = (eps_b_orig * shares_b_n)[_calib]
-            _denom = _implied.abs().clip(lower=1)
-            _err_incl = ((ni_n[_calib] - _implied).abs() / _denom).median()
-            _err_ex   = ((_ni_ex_nci[_calib] - _implied).abs() / _denom).median()
-            if pd.notna(_err_ex) and pd.notna(_err_incl) and _err_ex + 0.02 < _err_incl:
-                ni_for_eps = _ni_ex_nci
-                print(f"  [EPS Basis] Filed EPS implies NI excluding noncontrolling "
-                      f"interests (err {_err_ex:.1%} vs {_err_incl:.1%}); "
-                      f"derived EPS/shares will use NI - NCI.")
-
-    # Derive shares from NI / EPS where shares are missing
-    shares_b_calc = ni_for_eps / eps_b_orig
-    shares_b_n = shares_b_n.fillna(shares_b_calc)
-    # Forward-fill (bfill on columns sorted newest->oldest) to cover missing Q4 shares
-    shares_b_n = shares_b_n.bfill()
-
-    shares_b_to_add = shares_b_n[shares_b.isna() | (pd.to_numeric(shares_b, errors='coerce') == 0)]
-    if not shares_b_to_add.empty:
-        add_val('1_Income_Statement', 'Shares Outstanding Basic', shares_b_to_add)
-
-    # -- Diluted Shares -----------------------------------------------
-    eps_d_orig = get_num('EPS Diluted').replace(0, np.nan)
-    shares_d   = get_row('Shares Outstanding Diluted')
-    shares_d_n = pd.to_numeric(shares_d, errors='coerce').replace(0, np.nan)
-
-    shares_d_calc = ni_for_eps / eps_d_orig
-    shares_d_n = shares_d_n.fillna(shares_d_calc)
-    shares_d_n = shares_d_n.bfill()
-
-    shares_d_to_add = shares_d_n[shares_d.isna() | (pd.to_numeric(shares_d, errors='coerce') == 0)]
-    if not shares_d_to_add.empty:
-        add_val('1_Income_Statement', 'Shares Outstanding Diluted', shares_d_to_add)
-
-    # -- EPS from NI / Shares (fills missing EPS using derived shares) -
-    eps_b_calc = ni_for_eps / shares_b_n
-    eps_b_to_add = eps_b_calc[eps_b_orig.isna() & eps_b_calc.notna()]
-    if not eps_b_to_add.empty:
-        add_val('1_Income_Statement', 'EPS Basic', eps_b_to_add)
-
-    eps_d_calc = ni_for_eps / shares_d_n
-    eps_d_to_add = eps_d_calc[eps_d_orig.isna() & eps_d_calc.notna()]
-    if not eps_d_to_add.empty:
-        add_val('1_Income_Statement', 'EPS Diluted', eps_d_to_add)
-
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     # ADDITIONAL VISIBILITY ROWS
     # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
@@ -39547,21 +39648,19 @@ def _gb_normalize_large_coherent_stock_split_basis(
     share_multiplier = factor if direction == 1 else 1.0 / factor
     eps_multiplier = 1.0 / factor if direction == 1 else factor
 
-    for column in adjusted_columns:
-        for row_idx in (shares_basic, shares_diluted):
-            value = pd.to_numeric(
-                pd.Series([out.at[row_idx, column]]),
-                errors='coerce').iloc[0]
-            if pd.notna(value):
-                out.at[row_idx, column] = (
-                    float(value) * share_multiplier)
-        for row_idx in (eps_basic, eps_diluted):
-            value = pd.to_numeric(
-                pd.Series([out.at[row_idx, column]]),
-                errors='coerce').iloc[0]
-            if pd.notna(value):
-                out.at[row_idx, column] = (
-                    float(value) * eps_multiplier)
+    # Assign the four rows as blocks.  Repeated ``.at`` reads on a DataFrame
+    # carrying a large audit object copy attrs through boxed Series and make a
+    # routine split normalization take minutes.
+    share_rows = [shares_basic, shares_diluted]
+    eps_rows = [eps_basic, eps_diluted]
+    share_values = out.loc[share_rows, adjusted_columns].apply(
+        pd.to_numeric, errors='coerce')
+    eps_values = out.loc[eps_rows, adjusted_columns].apply(
+        pd.to_numeric, errors='coerce')
+    out.loc[share_rows, adjusted_columns] = (
+        share_values * share_multiplier).to_numpy()
+    out.loc[eps_rows, adjusted_columns] = (
+        eps_values * eps_multiplier).to_numpy()
 
     if (
         isinstance(fact_audit, pd.DataFrame)
@@ -40186,7 +40285,7 @@ def _institutional_cleanup_impl(df):
     return df
 
 
-def _save_pivot_xlsx(final_pivot, out_path):
+def _save_pivot_xlsx_legacy(final_pivot, out_path):
     """Write the final pivot to .xlsx, one sheet per statement category.
 
     Same values as the CSV (blanks stay blank), but each top-level Category --
@@ -40334,7 +40433,14 @@ def _save_pivot_xlsx(final_pivot, out_path):
             for j in range(C0 + 1, C0 + 1 + ncol_d):
                 ws.column_dimensions[get_column_letter(j)].width = 18
             ws.column_dimensions['A'].width = 3
-            ws.freeze_panes = get_column_letter(C0 + 1) + str(R0 + 1) 
+            ws.freeze_panes = get_column_letter(C0 + 1) + str(R0 + 1)
+
+
+def _save_pivot_xlsx(final_pivot, out_path, annual_pivot=None):
+    """Render the clean workbook and its normalized SEC lineage ledgers."""
+    from excel_lineage import save_pivot_xlsx
+
+    return save_pivot_xlsx(final_pivot, out_path, annual_pivot=annual_pivot)
 
 
 # ###########################################################################
@@ -40404,8 +40510,12 @@ def _fx_hash_blob(value):
 @lru_cache(maxsize=1)
 def _fx_code_fingerprint():
     try:
-        with open(__file__, "rb") as fh:
-            return hashlib.sha256(fh.read()).hexdigest()
+        digest = hashlib.sha256()
+        for path in (__file__, os.path.join(os.path.dirname(__file__), "pipeline_audit.py")):
+            with open(path, "rb") as fh:
+                digest.update(os.path.basename(path).encode("utf-8"))
+                digest.update(fh.read())
+        return digest.hexdigest()
     except Exception:
         return _FX_CACHE_VERSION
 
@@ -44909,7 +45019,7 @@ def _restore_native_mutable_state(snapshot):
 # and the learned accounting/tag state produced while extracting those facts.
 # This cache stores the extraction checkpoint after all selected filings have
 # been parsed, then restores that exact checkpoint on the next identical run.
-_NATIVE_EXTRACTION_CACHE_VERSION = "2026-08-06.native-extraction.v42-investment-quarterization"
+_NATIVE_EXTRACTION_CACHE_VERSION = "2026-09-16.native-extraction.v44-table-and-recursive-provenance"
 _NATIVE_EXTRACTION_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _NATIVE_EXTRACTION_CACHE_ENABLED = (
     os.environ.get("SEC_NATIVE_EXTRACTION_CACHE", "1").strip().lower()
@@ -45080,7 +45190,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
 _FINAL_PIVOT_CACHE_VERSION = (
-    "2026-08-08.final-pivot.v89-segment-audit-history-and-scope-guards"
+    "2026-09-16.final-pivot.v92-exact-output-evidence-gate"
 )
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
@@ -45430,11 +45540,15 @@ def build_annual_pivoted_data(all_facts, ticker, ye_month, company_name=None,
                               is_financial=False, is_insurance=False,
                               is_oil_gas=False, is_reit=False, limit=None):
     with _ProfileTimer("build_annual_pivoted_data_total"):
-        return _build_annual_pivoted_data_impl(
+        from pipeline_audit import enrich_output_audit, require_complete_output_evidence
+        result = _build_annual_pivoted_data_impl(
             all_facts, ticker, ye_month, company_name=company_name,
             is_financial=is_financial, is_insurance=is_insurance,
             is_oil_gas=is_oil_gas, is_reit=is_reit, limit=limit,
         )
+        enrich_output_audit(result, GLOBAL_CALC_PARENT,
+            _CF_OPERATING_PARENTS | _CF_INVESTING_PARENTS | _CF_FINANCING_PARENTS)
+        return require_complete_output_evidence(result)
 
 
 def _build_annual_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None,
@@ -45683,6 +45797,11 @@ def _build_annual_pivoted_data_impl(all_facts, ticker, ye_month, company_name=No
                 dt = end_by_period.get(col)
                 period_dates[col] = '' if pd.isna(dt) else pd.to_datetime(dt).strftime('%m/%d/%y')
         final_pivot.attrs['period_dates'] = period_dates
+        # Keep selected annual filing evidence available to the presentation
+        # layer. Calculated annual KPI rows remain explicit QA items when they
+        # do not have a selected filing row.
+        final_pivot.attrs['fact_audit'] = _gb_fact_audit_from_selected_rows(
+            selected_working, ticker)
         final_pivot.attrs['rpo_source_ledger'] = _rpo_source_ledger
 
     timer.emit()
@@ -45950,8 +46069,27 @@ def _run_native_annual_mode(ticker, company, ye_month, limit, use_arelle=False,
     print(f"Success! Annual data saved to {out_path}")
     return out_path
 
+def _configure_console_text_errors():
+    """Prevent diagnostic text from aborting a financial-data build.
+
+    Some historical log strings contain Unicode punctuation while Windows may
+    expose a legacy console encoding such as GBK.  Logging is non-canonical
+    output: an unencodable diagnostic must be replaced for display rather than
+    terminating an otherwise valid extraction.  Keep the active encoding so
+    interactive terminals retain their configured behavior.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
 def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
          save_xlsx=False, workers=None, annual=False, save_quality=False):
+    _configure_console_text_errors()
     _initialize_sec_identity()
     import builtins
     _original_print = builtins.print
@@ -46880,6 +47018,15 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
             final_pivot = _apply_quality_result_fixes(final_pivot)
             final_pivot = _sort_preserving_values(final_pivot, sort_key, is_item_order, is_financial, is_insurance, context="native quarterly final sort")
 
+            # Several late accounting/cleanup passes can create calculated
+            # cells after the builder-level evidence gate.  Apply the same
+            # generic rule at the final publication boundary so an unsupported
+            # zero or repair never reappears in the workbook.
+            from pipeline_audit import require_complete_output_evidence
+            final_pivot.attrs['fact_audit'] = _fact_audit
+            final_pivot = require_complete_output_evidence(final_pivot)
+            _fact_audit = final_pivot.attrs.get('fact_audit', _fact_audit)
+
             for _period, _display_date in _source_period_dates_from_audit(
                     _fact_audit).items():
                 if _period in final_pivot.columns and not period_dates.get(_period):
@@ -46989,6 +47136,14 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
         final_pivot = _gb_drop_strict_sparse_generic_segment_aliases(final_pivot)
         final_pivot = _sort_final_output_pivot(final_pivot, is_financial=is_financial, is_insurance=is_insurance, context="native quarterly pre-write sort")
 
+        # Absolute evidence boundary: nothing after this point may manufacture
+        # or restore a numeric financial cell without an exact, proven audit
+        # record.  This also executes for warm final-pivot cache reads.
+        from pipeline_audit import require_complete_output_evidence
+        final_pivot.attrs['fact_audit'] = _fact_audit
+        final_pivot = require_complete_output_evidence(final_pivot)
+        _fact_audit = final_pivot.attrs.get('fact_audit', _fact_audit)
+
         progress.set(98.0, "Writing output file")
         out_dir = "output/financials"
         os.makedirs(out_dir, exist_ok=True)
@@ -47015,9 +47170,25 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
             xlsx_dir = f"{out_dir}/excel"
             os.makedirs(xlsx_dir, exist_ok=True)
             out_path = f"{xlsx_dir}/{ticker}_financials.xlsx"
-            
+
             try:
-                _save_pivot_xlsx(final_pivot, out_path)
+                # Build the five-year annual companion from the same immutable
+                # fact ledger. This does not fetch filings or sum quarters.
+                _annual_state = _snapshot_native_mutable_state()
+                try:
+                    _annual_companion = build_annual_pivoted_data(
+                        all_facts, ticker, ye_month,
+                        company_name=_company_name,
+                        is_financial=is_financial,
+                        is_insurance=is_insurance,
+                        is_oil_gas=is_oil_gas,
+                        is_reit=is_reit,
+                        limit=5,
+                    )
+                finally:
+                    _restore_native_mutable_state(_annual_state)
+                _save_pivot_xlsx(
+                    final_pivot, out_path, annual_pivot=_annual_companion)
             except ImportError:
                 # Fallback to CSV in output/financials/
                 out_path = f"{out_dir}/{ticker}_financials.csv"
@@ -47081,7 +47252,7 @@ def _queue_child_command(
     """Build the one-ticker child command used by the parent queue."""
     command = [
         sys.executable,
-        os.path.abspath(__file__),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sec_data_cli.py'),
         '--ticker', str(ticker),
         '--limit', str(int(limit)),
         '--queue-child',
@@ -47394,124 +47565,10 @@ def run_ticker_queue(
     return results
 
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--ticker",
-        required=True,
-        nargs="+",
-        metavar="TICKER",
-        help=(
-            "One or more ticker symbols. Multiple symbols run as isolated "
-            "sequential child processes, for example: --ticker AMZN GOOGL UBER"
-        ),
-    )
-    parser.add_argument("--limit", type=int, default=50,
-                        help="Number of filings to pull per ticker (fewer = faster; less history).")
-    parser.add_argument("--no-arelle", action="store_true",
-                        help="Skip the slow Arelle custom-tag pre-pass "
-                             "(10-K annual filings and 20-F/40-F annual enrichment).")
-    parser.add_argument("--log", action="store_true", help="Print detailed logs")
-    parser.add_argument("--xlsx", action="store_true",
-                        help="Save as .xlsx (one sheet per statement) instead of CSV.")
-    parser.add_argument("--workers", type=int, default=None,
-                        help="Native 10-K/10-Q worker count used inside each isolated ticker process.")
-    parser.add_argument("--annual", action="store_true",
-                        help="For native 10-K filers, fetch 10-K/10-K/A annual filings only and output FY columns.")
-    parser.add_argument(
-        "--quality", "--save-quality", dest="save_quality",
-        action="store_true",
-        help=(
-            "Also save fact-audit and operating-alias CSV files under "
-            "output/quality. By default, only the financial output is saved."
-        ),
-    )
-    parser.add_argument(
-        "--stop-on-error",
-        action="store_true",
-        help="Stop the ticker queue immediately when one ticker fails. "
-             "By default, later tickers continue.",
-    )
-    parser.add_argument("--reset-identity", action="store_true",
-                        help="Delete the saved SEC contact identity and show first-run setup again.")
-    parser.add_argument("--queue-child", action="store_true",
-                        help=argparse.SUPPRESS)
-    parser.add_argument("--queue-result-file", default=None,
-                        help=argparse.SUPPRESS)
-    args = parser.parse_args()
-    if args.reset_identity:
-        _reset_cached_sec_identity()
+    # Compatibility entry point. New launchers should call sec_data_cli.py;
+    # keeping this shim means existing scripts continue to work unchanged.
+    from sec_data_cli import cli_main
 
-    if args.queue_child:
-        child_ticker = _normalize_ticker_queue(args.ticker)
-        if len(child_ticker) != 1:
-            parser.error("A queue child must receive exactly one ticker.")
-        ticker = child_ticker[0]
-        try:
-            output_path = main(
-                ticker,
-                args.limit,
-                use_arelle=not args.no_arelle,
-                log_output=args.log,
-                save_xlsx=args.xlsx,
-                workers=args.workers,
-                annual=args.annual,
-                save_quality=args.save_quality,
-            )
-            child_payload = {
-                'ticker': ticker,
-                'status': 'saved' if output_path else 'no_data',
-                'output_path': output_path,
-                'error': None,
-            }
-            _write_queue_child_result(args.queue_result_file, child_payload)
-        except KeyboardInterrupt:
-            raise
-        except Exception as exc:
-            trace_text = traceback.format_exc()
-            error_log = _record_ticker_failure(
-                ticker,
-                exc,
-                traceback_text=trace_text,
-                emit_to_stderr=False,
-                context={
-                    'mode': 'queue_child',
-                    'limit': args.limit,
-                    'workers': args.workers,
-                    'annual': args.annual,
-                    'arelle': not args.no_arelle,
-                },
-            )
-            if error_log:
-                print(
-                    f'[ERROR] Full traceback saved to: {error_log}',
-                    file=sys.stderr,
-                    flush=True,
-                )
-            child_payload = {
-                'ticker': ticker,
-                'status': 'failed',
-                'output_path': None,
-                'error': f'{type(exc).__name__}: {exc}',
-                'error_log': error_log,
-            }
-            _write_queue_child_result(args.queue_result_file, child_payload)
-            raise
-    else:
-        try:
-            queue_results = run_ticker_queue(
-                args.ticker,
-                args.limit,
-                use_arelle=not args.no_arelle,
-                log_output=args.log,
-                save_xlsx=args.xlsx,
-                workers=args.workers,
-                annual=args.annual,
-                stop_on_error=args.stop_on_error,
-                save_quality=args.save_quality,
-            )
-        except ValueError as exc:
-            parser.error(str(exc))
-
-        if any(result["status"] == "failed" for result in queue_results):
-            raise SystemExit(1)
+    raise SystemExit(cli_main(engine=sys.modules[__name__]))

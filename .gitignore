@@ -1,0 +1,17 @@
+.cache/
+.venv/
+output/
+outputs/
+review_luna/
+.tmp/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.env
+.env.*
+!.env.example
+*.pkl
+*.pickle
+*.log

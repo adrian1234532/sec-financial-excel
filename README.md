@@ -1,8 +1,8 @@
 <div align="center">
 
-# sec-data
+# SEC Financial Excel
 
-### Open-source SEC financial statement extraction for Python
+### Auditable SEC filings to research-ready Excel
 
 Convert SEC EDGAR filings into detailed, modelling-ready quarterly or annual financial statements stored locally as CSV or Excel files.
 
@@ -11,15 +11,56 @@ Convert SEC EDGAR filings into detailed, modelling-ready quarterly or annual fin
 [![Data source: SEC EDGAR](https://img.shields.io/badge/Data-SEC%20EDGAR-1f6feb)](https://www.sec.gov/edgar)
 [![Output: CSV and Excel](https://img.shields.io/badge/Output-CSV%20%7C%20Excel-217346)](#output)
 [![Runs locally](https://img.shields.io/badge/Architecture-Local--first-f59e0b)](#why-sec-data)
+[![CI](https://github.com/adrian1234532/sec-financial-excel/actions/workflows/ci.yml/badge.svg)](https://github.com/adrian1234532/sec-financial-excel/actions/workflows/ci.yml)
 
 </div>
 
 > [!IMPORTANT]
 > The primary supported workflow is **quarterly financial statement extraction for U.S. domestic filers using 10-Q and 10-K filings**. Annual extraction and foreign private issuer support are experimental.
 
+> [!NOTE]
+> This is an independently maintained audit-focused fork of
+> [baimmm6767/sec-data](https://github.com/baimmm6767/sec-data). It preserves
+> the upstream Apache-2.0 license and adds evidence-gated publication,
+> background source/lineage sheets, workbook verification, and regression
+> tests. It is not affiliated with the SEC or any filing company.
+
 **sec-data** is an open-source Python financial data extraction engine. It retrieves company filings directly from the SEC EDGAR database and transforms XBRL facts, company-specific tags, filing linkbases, historical comparative data, and selected HTML tables into structured financial statements.
 
 The result is a local dataset suitable for financial modelling, valuation, screening, research tools, dashboards, and other open-source financial applications.
+
+![LITE workbook overview](docs/assets/lite-overview.png)
+
+### Public Beta status
+
+| Layer | Meaning | Current status |
+|---|---|---|
+| Financial Core | 10-K/10-Q statements, periods, units, quarterly reconstruction, source lineage and accounting QA | Tested on GOOGL, RXRX and LITE examples |
+| Industry Mapping | Industry-specific statement and disclosure semantics | Partial; only explicit mappings are promoted |
+| Company KPI | Issuer-defined non-GAAP and operating metrics | Configured company by company |
+
+The project intentionally prefers a blank value and review item over a number
+that lacks complete source or derivation evidence. A successful example does
+not imply that every issuer or industry is supported.
+
+## Local source-audit changes (2026-09-16)
+
+The local fork repairs the generator, not individual Excel files. `pipeline_audit.py`
+links reported values to original SEC iXBRL/HTML cells, retains exact derivation
+operands and dates, and withholds unsupported values. `excel_lineage.py` keeps the
+front sheets clean and stores source IDs, concepts, contexts, locators and inputs
+in hidden audit sheets. The review queue is no longer silently capped at 30 items.
+
+Missing evidence is shown as `—`, never assumed to be zero. Q4 EPS/weighted shares
+cannot be obtained by subtraction; finance-lease repayments are not automatically
+classified as total long-term-debt repayments. A workbook can therefore remain
+`Financial Core: REVIEW` even when its displayed numbers pass evidence checks.
+
+Use the normal CLI for new companies. For a strictly offline replay of an existing
+trusted local checkpoint, use `tools/rebuild_cached_financials.py --help`; it requires
+a new output directory. Never load an untrusted pickle. Independently review an
+export with `review_luna/run_review.py --workbook <file> --output-dir <new-directory>`.
+That script is a local verifier; its name does not constitute a Luna or human signature.
 
 ## Contents
 
@@ -91,7 +132,94 @@ Its stable core is focused on detailed U.S. quarterly financial statements.
 | **KPI metrics** | Calculated financial ratios and selected filing-derived metrics |
 | **Integrity checks** | Internal reconciliation and accounting-identity diagnostics |
 
+### Excel: clean financial views, complete source trail
+
+The workbook reports semantic coverage in three layers:
+
+- **Financial Core** covers the standard 10-K/10-Q statements, fiscal periods,
+  unit normalization, quarter reconstruction, source lineage, and accounting QA.
+- **Industry Mapping** is added only for explicitly supported industries.
+- **Company KPI** is added only when an issuer mapping has been reviewed.
+
+A company can therefore be supported at the Financial Core level while its
+industry mapping remains `PARTIAL` and its company KPI status remains
+`NOT CONFIGURED`. Unknown or weakly classified disclosure metrics are retained
+with low confidence and sent to review; they are not promoted into a confident
+industry label. The guiding rule is: prefer an explicit unknown over a wrong
+classification.
+
+Excel exports keep provenance out of the financial tables. The visible sheets
+are designed for reading and modelling; normalized sources, lineage, raw KPI,
+and detailed QA ledgers are hidden by default and can be unhidden for audit.
+
+| Sheet | Purpose |
+|---|---|
+| `00_OVERVIEW` | Company, period range, headline metrics, and workbook navigation |
+| `01_ANNUAL` | Latest five fiscal years selected from 10-K annual facts |
+| `02_QUARTERLY` | Latest twelve standalone quarters when available |
+| `03_INCOME_STATEMENT` | Full income statement without repeated source columns |
+| `04_BALANCE_SHEET` | Full balance sheet without repeated source columns |
+| `05_CASH_FLOW` | Full cash-flow statement without repeated source columns |
+| `06_SEGMENTS` | Segment information |
+| `07_OPERATING_KPI` | Curated issuer-relevant research KPIs |
+| `08_QA` | Program checks and structural data-quality status |
+| `09_REVIEW` | A bounded queue of economic and semantic anomalies for review |
+| `90_SOURCES` | One row per SEC filing, including filed/accepted time and a stable `Source ID` |
+| `91_LINEAGE` | One row per displayed metric and period, linked to its `Source ID` |
+| `97_RAW_KPI` | Full automatic KPI/disclosure extraction ledger |
+| `98_RAW_QA` | Detailed engine and provenance diagnostics |
+
+Financial values are clickable and jump to their row in `91_LINEAGE`. A
+lineage row records `R` (reported), `D` (derived), `C` (calculated), or `M`
+(manual), plus the XBRL concept, context, unit, formula, method, semantic
+classification, confidence, and review requirement. Filing
+metadata and the SEC URL are stored once in `90_SOURCES`; hundreds of data
+points can reference the same source without repeating it.
+
+SEC links are real hyperlink relationships displayed as the restrained
+`SEC 原文 ↗` label. Lineage stores only the stable `Source ID`, which links
+back to the matching filing row.
+
+Front financial sheets display currency in USD millions while `91_LINEAGE`
+retains the exact stored values and explicit display scale. Program defects do
+not enter `09_REVIEW`. The review queue is limited to front-facing metrics and
+periods and compares only consecutive fiscal quarters; valid review items are
+not silently discarded by an arbitrary display cap.
+
+Comments are not used as the source of truth. This keeps the workbook small,
+filterable, and straightforward for programs or ChatGPT in Excel to audit.
+
 Generated files remain local and can be opened directly in spreadsheets, notebooks, databases, dashboards, or custom financial applications.
+
+### Lightweight module layout
+
+The runtime keeps a small set of practical modules:
+
+- `sec_data_cli.py` owns command-line arguments and process dispatch.
+- `sec_data.py` owns SEC extraction, period handling, selection, and calculations.
+- `excel_lineage.py` owns workbook presentation, source/lineage sheets, QA, and the build manifest.
+- `pipeline_audit.py` attaches exact financial calculation operands and filed cash-flow display signs.
+
+Source completion also runs in the normal generator, for every ticker. HTML
+values retain physical table/cell locators and validated period headers;
+quarter derivations retain their actual filing operands, dates, units and
+dimensions. Table-local numeric tags override inherited narrative context:
+revenue cannot be classified as an expense. Unreported zeroes, missing
+operands and unproved debt-family scopes remain in the audit/review backend
+and are withheld from the financial front sheets. A matching SEC URL or a
+passing workbook manifest check alone is not independent numeric acceptance.
+
+The delivery scope is the filing-to-Excel pipeline. Company KPI configuration,
+investment analysis, forecasts, and valuation are not completion requirements.
+Synthetic reconciliation residuals remain in backend Lineage rather than the
+face financial statements. `verify_workbook_manifest()` checks displayed
+financial amounts against the background rows linked by each cell.
+
+On Windows, `run.bat GOOGL --no-arelle --limit 16` generates an Excel workbook.
+Calling `run.bat` without arguments prompts for a ticker.
+
+Use `python sec_data_cli.py --ticker RXRX --xlsx --no-arelle` for new scripts.
+The historical `python sec_data.py ...` command remains compatible.
 
 ---
 
@@ -100,8 +228,8 @@ Generated files remain local and can be opened directly in spreadsheets, noteboo
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/baimmm6767/sec-data.git
-cd sec-data
+git clone https://github.com/adrian1234532/sec-financial-excel.git
+cd sec-financial-excel
 ```
 
 ### 2. Install the dependencies
@@ -118,16 +246,23 @@ On Windows:
 py -m pip install -r requirements.txt
 ```
 
+The default installation supports the normal EdgarTools path. To add optional
+Arelle taxonomy and linkbase enrichment, install instead:
+
+```bash
+python3 -m pip install -r requirements-arelle.txt
+```
+
 ### 3. Extract a company
 
 ```bash
-python3 sec_data.py --ticker NFLX
+python3 sec_data_cli.py --ticker NFLX
 ```
 
 On Windows:
 
 ```powershell
-py sec_data.py --ticker NFLX
+py sec_data_cli.py --ticker NFLX
 ```
 
 The generated CSV will be saved to:
@@ -139,7 +274,7 @@ output/financials/NFLX_financials.csv
 ### Export to Excel
 
 ```bash
-python3 sec_data.py --ticker NFLX --xlsx
+python3 sec_data_cli.py --ticker NFLX --xlsx
 ```
 
 The generated workbook will be saved to:
@@ -148,6 +283,9 @@ The generated workbook will be saved to:
 output/financials/excel/NFLX_financials.xlsx
 ```
 
+The workbook includes normalized source, lineage, raw KPI, and QA sheets
+automatically. No separate provenance flag is required.
+
 ### First-run SEC identity
 
 The first run asks for a name and email address for the SEC request `User-Agent`.
@@ -155,7 +293,7 @@ The first run asks for a name and email address for the SEC request `User-Agent`
 The identity is stored locally in the script cache and reused on later runs. It can be cleared with:
 
 ```bash
-python3 sec_data.py --ticker NFLX --reset-identity
+python3 sec_data_cli.py --ticker NFLX --reset-identity
 ```
 
 This contact information is required for responsible automated access to SEC EDGAR.
@@ -218,7 +356,7 @@ Use `--log` to display detailed information such as:
 - Rejected or superseded facts
 
 ```bash
-python3 sec_data.py --ticker NFLX --log
+python3 sec_data_cli.py --ticker NFLX --log
 ```
 
 ---
@@ -226,7 +364,7 @@ python3 sec_data.py --ticker NFLX --log
 ## CLI arguments
 
 ```text
-python3 sec_data.py --ticker TICKER [options]
+python3 sec_data_cli.py --ticker TICKER [options]
 ```
 
 | Argument | Required | Default | Description |
@@ -247,49 +385,49 @@ The default worker count can also be set with the `SEC_MAX_WORKERS` environment 
 #### Quarterly CSV
 
 ```bash
-python3 sec_data.py --ticker AAPL
+python3 sec_data_cli.py --ticker AAPL
 ```
 
 #### Quarterly Excel workbook
 
 ```bash
-python3 sec_data.py --ticker AAPL --xlsx
+python3 sec_data_cli.py --ticker AAPL --xlsx
 ```
 
 #### Limit the run to 12 filings
 
 ```bash
-python3 sec_data.py --ticker AAPL --limit 12
+python3 sec_data_cli.py --ticker AAPL --limit 12
 ```
 
 #### Use four workers
 
 ```bash
-python3 sec_data.py --ticker AAPL --workers 4
+python3 sec_data_cli.py --ticker AAPL --workers 4
 ```
 
 #### Display detailed logs
 
 ```bash
-python3 sec_data.py --ticker AAPL --log
+python3 sec_data_cli.py --ticker AAPL --log
 ```
 
 #### Skip Arelle enrichment
 
 ```bash
-python3 sec_data.py --ticker AAPL --no-arelle
+python3 sec_data_cli.py --ticker AAPL --no-arelle
 ```
 
 #### Extract annual data
 
 ```bash
-python3 sec_data.py --ticker AAPL --annual
+python3 sec_data_cli.py --ticker AAPL --annual
 ```
 
 #### Combine arguments
 
 ```bash
-python3 sec_data.py \
+python3 sec_data_cli.py \
   --ticker AAPL \
   --limit 24 \
   --workers 4 \
@@ -300,7 +438,7 @@ python3 sec_data.py \
 Windows PowerShell:
 
 ```powershell
-py sec_data.py `
+py sec_data_cli.py `
   --ticker AAPL `
   --limit 24 `
   --workers 4 `
@@ -523,6 +661,15 @@ output/financials/excel/AAPL_financials.xlsx
 
 The workbook separates major statement sections into individual sheets for easier spreadsheet analysis.
 
+Front sheets use a conservative gate. A value with low semantic confidence,
+missing source evidence, or a missing calculation expression is kept in
+`91_LINEAGE` and `09_REVIEW`, while the front sheet shows `—`. `08_QA` checks
+source, unit and formula coverage plus basic balance-sheet and cash-flow
+equations. Overview status is derived from those checks.
+
+Each XLSX export also creates a neighboring `.manifest.json` with the workbook
+hash, semantic hash, source accessions and source-code hash.
+
 ### Period ordering
 
 CSV output is arranged with the newest period first.
@@ -664,7 +811,7 @@ It can help with:
 Arelle can increase runtime. Use `--no-arelle` for a faster run when the additional taxonomy enrichment is not required.
 
 ```bash
-python3 sec_data.py --ticker AAPL --no-arelle
+python3 sec_data_cli.py --ticker AAPL --no-arelle
 ```
 
 Skipping Arelle does not disable the entire extraction process. It disables that enrichment layer.
@@ -834,3 +981,7 @@ Contributions should prioritize general improvements over ticker-specific patche
 ## License
 
 Licensed under the [Apache License 2.0](LICENSE).
+
+This repository is a modified fork; see [NOTICE](NOTICE) for attribution and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for direct dependency license
+information.

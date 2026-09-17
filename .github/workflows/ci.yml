@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r requirements.txt pytest ruff mypy
+      - run: python -m pytest -q -p no:cacheprovider
+      - run: ruff check pipeline_audit.py excel_lineage.py sec_data_cli.py tests tools
+      - run: mypy --ignore-missing-imports pipeline_audit.py excel_lineage.py sec_data_cli.py

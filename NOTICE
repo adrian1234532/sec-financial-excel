@@ -1,0 +1,13 @@
+SEC Financial Excel / sec-data audit fork
+
+This repository is a modified fork of:
+https://github.com/baimmm6767/sec-data
+
+The original project and this modified distribution are provided under the
+Apache License, Version 2.0. The modifications add evidence-gated Excel output,
+source and lineage sheets, semantic review queues, workbook verification,
+fault-injection tests, and a smaller command-line boundary.
+
+SEC EDGAR filings and extracted XBRL data are public source material. This
+project is not affiliated with or endorsed by the U.S. Securities and Exchange
+Commission or by any filing company.
